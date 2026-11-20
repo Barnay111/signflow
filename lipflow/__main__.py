@@ -61,6 +61,8 @@ def main(argv=None):
     lv.add_argument("--threshold", type=float, default=None, help="default: the model's own")
     lv.add_argument("--crop", help="x,y,w,h in pixels or fractions, or br|bl|tr|tl|right|left (interpreter inset)")
     lv.add_argument("--out", help="save the transcript (with timestamps) here on exit")
+    lv.add_argument("--record", action="store_true", help="start recording right away (R toggles it in the window)")
+    lv.add_argument("--out-dir", default="recordings", help="where recordings go (video + .txt + .srt)")
 
     sub.add_parser("doctor", help="check permissions, camera and model files")
     sub.add_parser("onboard", help="open the setup window (permissions, Wispr import, train on your face)")
@@ -105,7 +107,7 @@ def main(argv=None):
             print(f"text:  {c([raw])}   [{c.describe()}]")
     elif cmd == "live":
         from .live import run as live
-        live(args.camera, args.model, args.threshold, args.crop, args.out)
+        live(args.camera, args.model, args.threshold, args.crop, args.out, args.record, args.out_dir)
     elif cmd == "import-wispr":
         from .personal import PHRASES, import_wispr, save_phrases
         from .vocab import PATH as WORDS

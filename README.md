@@ -18,11 +18,15 @@ mode is still here; the rest of this README after the Signflow sections describe
 
 ```sh
 uv run lipflow live                    # camera on; every sign is added to a running transcript
+uv run lipflow live --record           # …and record: video + text + subtitles in ./recordings
 uv run lipflow live --camera news.mp4 --crop 47,392,305,287 --out news.txt   # a video, cropped to the interpreter
 ```
 
 The window shows the camera, the model's top 3 guesses for the current 2-second window and the
-transcript. Space pauses, C clears, S saves (with timestamps), Q quits. Fingerspelled letters join
+transcript. R starts/stops recording, Space pauses, C clears, S saves (with timestamps), Q quits.
+A recording is `recordings/signflow-<time>.mp4` plus `.txt` (the text, and every sign with its
+time in the video) and `.srt` subtitles: open the video in any player and the text appears at
+each sign. Fingerspelled letters join
 into one word. The model is `signflow` (Logos backbone + a head trained on Slovo and Bukva by
 `scripts/train_head.py`), or `logos` if that hasn't been trained. On an M-series CPU one window
 takes about 0.7 s, so the transcript lags speech by roughly 2–3 s.

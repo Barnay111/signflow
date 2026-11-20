@@ -4,7 +4,11 @@
     uv run lipflow live --camera 1               # another camera
     uv run lipflow live --camera news.mp4 --crop br   # a video file, cropped to the interpreter
 
-Keys in the window: Space pause/resume · C clear · S save transcript · Q / Esc quit.
+    uv run lipflow live --record                 # also record: video + transcript + subtitles
+
+Keys in the window: R start/stop recording · Space pause/resume · C clear · S save transcript · Q / Esc quit.
+A recording is saved to --out-dir (default ./recordings) as signflow-<time>.mp4 with .txt (the text and
+every sign with its time in the video) and .srt subtitles, so the text appears in the player at each sign.
 
 The capture loop keeps frames at SAMPLE_FPS in a ring buffer; a worker thread classifies the newest
 WINDOW frames whenever STRIDE new ones have arrived (or as soon as it is free, if the model is slower
@@ -64,7 +68,8 @@ class Live:
         self.cond = threading.Condition()
         self.running = True
         self.paused = False
-        self.glosses: list[tuple[float, str, float]] = []  # (time, gloss, prob)
+        self.glosses: list[tuple[float, str, float]] = []  # (time, gloss, prob) — on screen; C clears
+        self.history: list[tuple[float, str, float]] = []  # everything, for recordings
         self.merger = self.reader.stream()
         self.top: list[tuple[str, float]] = []
         self.latency = 0.0
@@ -91,6 +96,7 @@ class Live:
             if g is not None:
                 mid = ts[len(ts) // 2]
                 self.glosses.append((mid, g, float(p[k])))
+                self.history.append((mid, g, float(p[k])))
                 print(f"  {mid:7.1f}s  {g}  {p[k]:.0%}", flush=True)
 
     def text(self) -> str:
@@ -128,7 +134,7 @@ class Live:
         d = ImageDraw.Draw(img)
         # status + current guesses
         status = (f"{self.reader.name} · {'ПАУЗА' if self.paused else 'распознаю'} · "
-                  f"{self.latency * 1000:.0f} мс/окно · Space пауза  C очистить  S сохранить  Q выход")
+                  f"{self.latency * 1000:.0f} мс/окно · R запись  Space пауза  C очистить  S сохранить  Q выход")
         d.rectangle([0, 0, VIEW_W, 30], fill=(0, 0, 0))
         d.text((10, 6), status, font=small, fill=(200, 200, 200))
         thr = self.threshold or self.reader.threshold
@@ -153,8 +159,68 @@ class Live:
         print(f"saved {path}")
 
 
+def srt(glosses: list[tuple[float, str, float]], hold: float = 4.0, words: int = 6) -> str:
+    """Subtitles: at each sign, the last few recognised words (letters joined), shown until the next
+    sign or for `hold` seconds."""
+    def ts(t):
+        ms = int(round(max(t, 0) * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    cues = []
+    for i, (t, _, _) in enumerate(glosses):
+        end = min(glosses[i + 1][0] if i + 1 < len(glosses) else t + hold, t + hold)
+        text = " ".join(SignReader.to_text([(g, p) for _, g, p in glosses[:i + 1]]).split()[-words:])
+        cues.append(f"{len(cues) + 1}\n{ts(t)} --> {ts(max(end, t + 0.5))}\n{text}\n")
+    return "\n".join(cues)
+
+
+class Recorder:
+    """Writes the camera to an mp4 at a constant FPS (frames repeated or dropped to follow the clock,
+    so the video stays in sync with sign times) and, at the end, the signs made while recording."""
+    FPS = 30.0
+
+    def __init__(self, out_dir: str, size: tuple[int, int], t0: float):
+        os.makedirs(out_dir, exist_ok=True)
+        self.base = os.path.join(out_dir, time.strftime("signflow-%Y%m%d-%H%M%S"))
+        self.t0, self.written = t0, 0
+        for codec in ("avc1", "mp4v"):  # H.264 where OpenCV has it, else MPEG-4
+            self.writer = cv2.VideoWriter(self.base + ".mp4", cv2.VideoWriter_fourcc(*codec), self.FPS, size)
+            if self.writer.isOpened():
+                break
+        if not self.writer.isOpened():
+            raise RuntimeError(f"can't write {self.base}.mp4")
+        print(f"● recording → {self.base}.mp4", flush=True)
+
+    def write(self, frame: np.ndarray, t: float):
+        due = int((t - self.t0) * self.FPS) + 1
+        while self.written < due:
+            self.writer.write(frame)
+            self.written += 1
+
+    @property
+    def seconds(self) -> float:
+        return self.written / self.FPS
+
+    def finish(self, history: list[tuple[float, str, float]]) -> list[str]:
+        self.writer.release()
+        end = self.t0 + self.seconds
+        signs = [(t - self.t0, g, p) for t, g, p in history if self.t0 - 1.0 <= t <= end]
+        text = SignReader.to_text([(g, p) for _, g, p in signs])
+        with open(self.base + ".txt", "w", encoding="utf-8") as f:
+            f.write((text or "(ничего не распознано)") + "\n\n")
+            for t, g, p in signs:
+                f.write(f"{max(t, 0):8.1f}s\t{g}\t{p:.0%}\n")
+        with open(self.base + ".srt", "w", encoding="utf-8") as f:
+            f.write(srt(signs))
+        files = [self.base + e for e in (".mp4", ".txt", ".srt")]
+        print(f"■ saved {self.seconds:.0f}s, {len(signs)} signs: {', '.join(files)}", flush=True)
+        if text:
+            print(f"  {text}", flush=True)
+        return files
+
+
 def run(camera: str = "0", model: "str | None" = None, threshold: "float | None" = None,
-        crop: "str | None" = None, out: "str | None" = None):
+        crop: "str | None" = None, out: "str | None" = None, record: bool = False,
+        out_dir: str = "recordings"):
     if model is None:
         model = "signflow" if os.path.exists(os.path.join(MODELS_DIR, "signflow_head.pt")) else DEFAULT_MODEL
     is_file = not str(camera).isdigit()
@@ -176,7 +242,9 @@ def run(camera: str = "0", model: "str | None" = None, threshold: "float | None"
     win = "Signflow live"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
     t0, next_t, n_read = time.time(), 0.0, 0
-    print("window open · Space pause · C clear · S save · Q quit", flush=True)
+    rec: "Recorder | None" = None
+    want_rec = record
+    print("window open · R record · Space pause · C clear · S save · Q quit", flush=True)
     try:
         while True:
             ok, frame = cap.read()
@@ -195,11 +263,25 @@ def run(camera: str = "0", model: "str | None" = None, threshold: "float | None"
                 while next_t <= t + 1e-6:
                     next_t += 1.0 / SAMPLE_FPS
                 live.push_frame(frame, t)
-            cv2.imshow(win, live.render(frame, mirror=not is_file, fonts=fonts))
+            if want_rec and rec is None:
+                rec = Recorder(out_dir, (frame.shape[1], frame.shape[0]), t)
+            if rec is not None:
+                rec.write(frame, t)
+            view = live.render(frame, mirror=not is_file, fonts=fonts)
+            if rec is not None:  # REC badge, top right
+                cv2.circle(view, (VIEW_W - 110, 15), 7, (0, 0, 255), -1)
+                cv2.putText(view, f"REC {int(rec.seconds) // 60}:{int(rec.seconds) % 60:02d}", (VIEW_W - 98, 21),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.imshow(win, view)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == ord(" "):
+            if key == ord("r"):
+                want_rec = rec is None
+                if rec is not None:
+                    rec.finish(live.history)
+                    rec = None
+            elif key == ord(" "):
                 live.paused = not live.paused
                 with live.cond:
                     live.cond.notify()
@@ -208,6 +290,9 @@ def run(camera: str = "0", model: "str | None" = None, threshold: "float | None"
             elif key == ord("s"):
                 live.save(out or time.strftime("signflow-%Y%m%d-%H%M%S.txt"))
     finally:
+        if rec is not None:
+            time.sleep(min(live.latency + 0.2, 2.0))  # let the last window finish
+            rec.finish(live.history)
         with live.cond:
             live.running = False
             live.cond.notify()
